@@ -162,12 +162,19 @@ class _LiquidGlassState extends State<_LiquidGlass>
         // Visual specifications based on variant
         final bool isRegular = widget.glass.variant == GlassVariant.regular;
         final double blurAmount = isRegular ? 40.0 : 15.0;
-        final double baseWhiteAlpha = isRegular ? 0.08 : 0.02;
+        final double lensScale = isRegular
+            ? 1.05
+            : 1.01; // REAL Lensing magnification factor!
+        final double baseWhiteAlpha = isRegular ? 0.05 : 0.01;
 
         // Tint / Illumination alpha
         final double tintAlpha = widget.glass.tintColor.a == 0.0
             ? 0.0
             : widget.glass.tintColor.a;
+
+        // Precompute lens matrix for refraction
+        final Matrix4 lensMatrix = Matrix4.identity()
+          ..scale(lensScale, lensScale);
 
         return Transform.scale(
           scale: scale,
@@ -180,7 +187,6 @@ class _LiquidGlassState extends State<_LiquidGlass>
               fit: StackFit.passthrough,
               children: [
                 // 1. Shadow Layer (Depth & spatial separation)
-                // Painted via CustomPaint to respect ShapeBorder outsets
                 CustomPaint(
                   painter: _GlassShadowPainter(
                     shape: widget.shape,
@@ -197,12 +203,15 @@ class _LiquidGlassState extends State<_LiquidGlass>
                   child: Stack(
                     fit: StackFit.passthrough,
                     children: [
-                      // 2. Refraction Layer (Lensing)
-                      // distorts background pixels
+                      // 2. TRUE Refraction Layer (Lensing = Blur + Magnification)
+                      // This bends the view BEHIND the glass, acting like a real lens.
                       BackdropFilter(
-                        filter: ImageFilter.blur(
-                          sigmaX: blurAmount,
-                          sigmaY: blurAmount,
+                        filter: ImageFilter.compose(
+                          outer: ImageFilter.blur(
+                            sigmaX: blurAmount,
+                            sigmaY: blurAmount,
+                          ),
+                          inner: ImageFilter.matrix(lensMatrix.storage),
                         ),
                         child: const SizedBox.shrink(),
                       ),
@@ -219,7 +228,8 @@ class _LiquidGlassState extends State<_LiquidGlass>
                         ),
                       ),
 
-                      // 4. Highlight Layer (Specular Highlights & Environment Reflection)
+                      // 4. Highlight Layer (Volumetric Specular Highlights & Environment Reflection)
+                      // Simulated using a dynamic linear gradient that catches light strongly on top-left.
                       Container(
                         decoration: ShapeDecoration(
                           shape: widget.shape,
@@ -231,20 +241,33 @@ class _LiquidGlassState extends State<_LiquidGlass>
                             end: Alignment.bottomRight,
                             colors: [
                               Colors.white.withAlpha(
-                                ((0.3 + highlight * 0.4).clamp(0.0, 1.0) * 255)
+                                ((0.4 + highlight * 0.5).clamp(0.0, 1.0) * 255)
                                     .round(),
-                              ),
+                              ), // Strong top-left reflection
                               Colors.white.withAlpha(
-                                ((0.05 + highlight * 0.1).clamp(0.0, 1.0) * 255)
+                                ((0.05 + highlight * 0.2).clamp(0.0, 1.0) * 255)
                                     .round(),
                               ),
                               Colors.transparent,
+                              Colors.black.withAlpha(
+                                ((0.05).clamp(0.0, 1.0) * 255).round(),
+                              ), // Depth shading on bottom right
                               Colors.white.withAlpha(
-                                ((0.1 + highlight * 0.2).clamp(0.0, 1.0) * 255)
+                                ((0.15 + highlight * 0.2).clamp(0.0, 1.0) * 255)
                                     .round(),
-                              ),
+                              ), // Small bottom rim light
                             ],
-                            stops: const [0.0, 0.4, 0.6, 1.0],
+                            stops: const [0.0, 0.25, 0.6, 0.8, 1.0],
+                          ),
+                        ),
+                      ),
+
+                      // Glare overlay to give volumetric thickness (Apple's top inner bevel reflection)
+                      Positioned.fill(
+                        child: CustomPaint(
+                          painter: _GlassGlarePainter(
+                            shape: widget.shape,
+                            highlightPhase: highlight,
                           ),
                         ),
                       ),
@@ -252,7 +275,7 @@ class _LiquidGlassState extends State<_LiquidGlass>
                   ),
                 ),
 
-                // 5. Dispersion Layer (Chromatic Aberration / Luminous Edge)
+                // 5. Dispersion Layer (Chromatic Aberration / Asymmetric Luminous Edge)
                 // Painted over the clipped glass to give multi-color rim light
                 CustomPaint(
                   foregroundPainter: _LiquidDispersionPainter(
@@ -300,7 +323,40 @@ class _GlassShadowPainter extends CustomPainter {
   }
 }
 
-/// Renders the Dispersion (Chromatic Aberration) and luminous edge.
+/// Renders a soft radial glare on the top-left to simulate volumetric glass curvature
+class _GlassGlarePainter extends CustomPainter {
+  final ShapeBorder shape;
+  final double highlightPhase;
+
+  _GlassGlarePainter({required this.shape, required this.highlightPhase});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    final path = shape.getInnerPath(rect);
+
+    final paint = Paint()
+      ..shader = RadialGradient(
+        center: const Alignment(-0.6, -0.6),
+        radius: 0.8 + (highlightPhase * 0.2),
+        colors: [
+          Colors.white.withAlpha(
+            ((0.15 + highlightPhase * 0.15) * 255).round(),
+          ),
+          Colors.transparent,
+        ],
+      ).createShader(rect);
+
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _GlassGlarePainter oldDelegate) =>
+      oldDelegate.highlightPhase != highlightPhase ||
+      oldDelegate.shape != shape;
+}
+
+/// Renders the Dispersion (Chromatic Aberration) and luminous asymmetric edge.
 class _LiquidDispersionPainter extends CustomPainter {
   final ShapeBorder shape;
   final double highlightPhase;
@@ -313,32 +369,46 @@ class _LiquidDispersionPainter extends CustomPainter {
     final path = shape.getInnerPath(rect);
 
     // Multi-pass stroke to create subtle chromatic dispersion
-    // Red channel
     _drawStroke(
       canvas,
       path,
-      const Color(0x33FF6B6B),
+      const Color(0x33FF6B6B), // Red
       1.5 + highlightPhase * 0.5,
-      const Offset(0.5, 0.5),
+      const Offset(0.3, 0.3),
     );
-    // Blue channel
     _drawStroke(
       canvas,
       path,
-      const Color(0x334ECDC4),
+      const Color(0x334ECDC4), // Cyan
       1.5 + highlightPhase * 0.5,
-      const Offset(-0.5, -0.5),
+      const Offset(-0.3, -0.3),
     );
-    // Core white rim
-    _drawStroke(
-      canvas,
-      path,
-      Colors.white.withAlpha(
-        ((0.4 + highlightPhase * 0.4).clamp(0.0, 1.0) * 255).round(),
-      ),
-      1.0 + highlightPhase,
-      Offset.zero,
-    );
+
+    // To mirror the WWDC Control Center glass, the edge isn't uniform.
+    // Top and Left edges are thick and bright (catching the light), Bottom and Right are subtle.
+    // We achieve this with a LinearGradient stroke on the path.
+    final edgePaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [
+          Colors.white.withAlpha(
+            ((0.75 + highlightPhase * 0.25).clamp(0.0, 1.0) * 255).round(),
+          ), // Bright top-left specular
+          Colors.white.withAlpha(
+            ((0.15 + highlightPhase * 0.1).clamp(0.0, 1.0) * 255).round(),
+          ), // Subtle core
+          Colors.white.withAlpha(0), // Fade out
+          Colors.white.withAlpha(
+            ((0.3 + highlightPhase * 0.2).clamp(0.0, 1.0) * 255).round(),
+          ), // Slight rim light on bottom right
+        ],
+        stops: const [0.0, 0.4, 0.7, 1.0],
+      ).createShader(rect)
+      ..strokeWidth = 1.0 + (highlightPhase * 1.5)
+      ..style = PaintingStyle.stroke;
+
+    canvas.drawPath(path, edgePaint);
   }
 
   void _drawStroke(
